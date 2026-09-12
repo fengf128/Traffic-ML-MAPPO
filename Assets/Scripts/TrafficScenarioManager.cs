@@ -1,0 +1,549 @@
+using System.Collections.Generic;
+using UnityEngine;
+using Unity.MLAgents.SideChannels;
+
+/// <summary>
+/// 面板可见的场景模式枚举。
+/// - UniformFlow：均匀车流（静态全局）
+/// - DynamicShockwave：动态突变（内部通过 ActiveShockwaveState 抽取子模式）
+/// </summary>
+public enum TrafficScenario
+{
+    UniformFlow,     // 均匀车流
+    DynamicShockwave // 动态突变
+}
+
+/// <summary>
+/// 动态突变模式的子模式枚举，供盲盒抽取使用。
+/// </summary>
+public enum ActiveShockwaveState
+{
+    Uniform,    // 均匀车流（抽取池中保留，占比 1/5）
+    EastHeavy,  // 东向单向潮汐
+    WestHeavy,  // 西向单向潮汐
+    NorthHeavy, // 北向单向潮汐
+    SouthHeavy  // 南向单向潮汐
+}
+
+/// <summary>
+/// 交通流全局管理器。
+///
+/// 工作模式：
+/// 1. 静态模式（面板选择 UniformFlow）：
+///    全网统一发车，乘数固定为 1.8f。
+/// 2. 动态突变模式（面板选择 DynamicShockwave）：
+///    每局前 200 秒强制为 Uniform；到达 200 秒时从 {Uniform, EastHeavy, WestHeavy, NorthHeavy, SouthHeavy}
+///    中等概率随机抽取 1 个，锁死到本局结束，绝不多方向同时爆发。
+/// </summary>
+public class TrafficScenarioManager : MonoBehaviour
+{
+    public static TrafficScenarioManager Instance { get; private set; }
+
+    // ============ 公开配置（供 Inspector 控制） ============
+
+    [Header("场景模式")]
+    [Tooltip("UniformFlow=均匀流；DynamicShockwave=动态随机（200秒后五选一单向潮汐）")]
+    public TrafficScenario currentScenario = TrafficScenario.UniformFlow;
+
+    [Header("评估模式")]
+    [Tooltip("开启后，每局使用固定种子重置全局随机数，确保测试车流严格一致")]
+    public bool isEvaluationMode = false;
+    [Tooltip("评估模式使用的全局随机种子")]
+    public int evaluationSeed = 128;
+
+    [Header("动态模式配置")]
+    [Tooltip("动态模式下，从均匀流切换到单向潮汐的等待时间（秒）。默认 150 秒。")]
+    public float phaseDuration = 150f;
+
+    [Tooltip("潮汐结束，进入冷却消散期的时间（秒）。默认 400 秒。")]
+    public float cooldownStartTime = 400f;
+
+    // ============ 私有运行时状态 ============
+
+    /// <summary>
+    /// 当前实际生效的子模式（动态模式下由盲盒抽取赋值）。
+    /// 前 phaseDuration 秒固定为 Uniform；到达时从 {Uniform, EastHeavy, WestHeavy, NorthHeavy, SouthHeavy} 中抽取一个。
+    /// </summary>
+    private ActiveShockwaveState currentActiveState = ActiveShockwaveState.Uniform;
+
+    /// <summary>
+    /// 当前阶段已消耗的时间（秒）。
+    /// </summary>
+    private float timer = 0f;
+
+    /// <summary>
+    /// 潮汐车道掩码，长度为 3。
+    /// activeHeavyMask[i] == true 表示第 i 组车道处于潮汐激活状态（极速发车）。
+    /// </summary>
+    private bool[] activeHeavyMask = new bool[3];
+    // Evaluation-only planned shockwave.
+    // Generated from an independent random stream at episode reset.
+    private ActiveShockwaveState plannedShockwaveState =
+    ActiveShockwaveState.Uniform;
+
+    private bool[] plannedHeavyMask = new bool[3];
+
+    /// <summary>
+    /// 标记本局是否已经触发过盲盒抽取。
+    /// 到达 phaseDuration 且 hasRolledShockwave == false 时触发抽取；抽取后锁死为 true，
+    /// 直至下一局 ResetForNewEpisode() 重置。
+    /// </summary>
+    private bool hasRolledShockwave = false;
+    private int agentResetCallCount = 0;
+    private TrafficSpawner[] trafficSpawners;
+    private TrafficTelemetrySideChannel telemetryChannel;
+
+    // ============ 生命周期 ============
+
+  private void Awake()
+{
+    if (Instance != null && Instance != this)
+    {
+        Destroy(gameObject);
+        return;
+    }
+
+    Instance = this;
+
+    CacheTrafficSpawners();
+
+    telemetryChannel = new TrafficTelemetrySideChannel();
+    SideChannelManager.RegisterSideChannel(telemetryChannel);
+}
+private void OnDestroy()
+{
+    if (telemetryChannel != null)
+    {
+        SideChannelManager.UnregisterSideChannel(
+            telemetryChannel
+        );
+
+        telemetryChannel = null;
+    }
+
+    if (Instance == this)
+    {
+        Instance = null;
+    }
+}
+   private void Update()
+{
+    if (currentScenario == TrafficScenario.DynamicShockwave)
+    {
+        timer += Time.deltaTime;
+
+        if (timer >= phaseDuration && !hasRolledShockwave)
+        {
+            if (isEvaluationMode)
+            {
+                // Evaluation: activate the result prepared at episode reset.
+                ActivatePreparedEvaluationShockwave();
+            }
+            else
+            {
+                // Training: preserve the original random behavior.
+                int roll = Random.Range(0, 5);
+                currentActiveState =
+                    (ActiveShockwaveState)roll;
+
+                GenerateActiveHeavyMask();
+            }
+
+            hasRolledShockwave = true;
+        }
+    }
+
+    debug_PhaseTimer = timer;
+    debug_CurrentScenario = currentScenario;
+    debug_CurrentActiveState = currentActiveState;
+    debug_HasRolledShockwave = hasRolledShockwave;
+}
+    private void CacheTrafficSpawners()
+    {
+        trafficSpawners = FindObjectsOfType<TrafficSpawner>();
+
+        // 固定重启顺序，避免查找结果顺序变化影响随机数调用顺序
+        System.Array.Sort(trafficSpawners, (a, b) =>
+        {
+            int result = ((int)a.myDirection).CompareTo(
+                (int)b.myDirection
+            );
+
+            if (result != 0)
+                return result;
+
+            result = a.laneIndex.CompareTo(b.laneIndex);
+
+            if (result != 0)
+                return result;
+
+            result = a.transform.position.x.CompareTo(
+                b.transform.position.x
+            );
+
+            if (result != 0)
+                return result;
+
+            result = a.transform.position.z.CompareTo(
+                b.transform.position.z
+            );
+
+            if (result != 0)
+                return result;
+
+            return string.CompareOrdinal(a.name, b.name);
+        });
+    }
+
+    private void RestartAllSpawnersForNewEpisode()
+    {
+        if (trafficSpawners == null || trafficSpawners.Length == 0)
+        {
+            CacheTrafficSpawners();
+        }
+
+        for (int i = 0; i < trafficSpawners.Length; i++)
+        {
+            TrafficSpawner spawner = trafficSpawners[i];
+
+            if (spawner != null)
+            {
+                spawner.RestartForNewEpisode(
+                    evaluationSeed,
+                    i,
+                    isEvaluationMode
+                );
+            }
+        }
+    }
+    private int GetCurrentStage()
+{
+    if (timer < phaseDuration)
+    {
+        return 0; // 均匀期
+    }
+
+    if (timer < cooldownStartTime)
+    {
+        return 1; // 潮汐期
+    }
+
+    return 2; // 冷却期
+}
+
+private bool IsCurrentHeavyDirection(
+    SpawnerDirection direction
+)
+{
+    switch (currentActiveState)
+    {
+        case ActiveShockwaveState.EastHeavy:
+            return direction == SpawnerDirection.East;
+
+        case ActiveShockwaveState.WestHeavy:
+            return direction == SpawnerDirection.West;
+
+        case ActiveShockwaveState.NorthHeavy:
+            return direction == SpawnerDirection.North;
+
+        case ActiveShockwaveState.SouthHeavy:
+            return direction == SpawnerDirection.South;
+
+        default:
+            return false;
+    }
+}
+
+private TrafficSpawner[] GetActiveHeavySpawners()
+{
+    if (
+        trafficSpawners == null ||
+        trafficSpawners.Length == 0
+    )
+    {
+        CacheTrafficSpawners();
+    }
+
+    List<TrafficSpawner> active =
+        new List<TrafficSpawner>();
+
+    foreach (TrafficSpawner spawner in trafficSpawners)
+    {
+        if (spawner == null)
+        {
+            continue;
+        }
+
+        int laneIndex = Mathf.Clamp(
+            spawner.laneIndex,
+            0,
+            2
+        );
+
+        bool directionMatches =
+            IsCurrentHeavyDirection(
+                spawner.myDirection
+            );
+
+        bool laneMatches =
+            activeHeavyMask[laneIndex];
+
+        if (directionMatches && laneMatches)
+        {
+            active.Add(spawner);
+        }
+    }
+
+    return active.ToArray();
+}
+
+public void SendTelemetrySnapshot()
+{
+    // 训练时完全不发送，不增加训练通信负担
+    if (!isEvaluationMode || telemetryChannel == null)
+    {
+        return;
+    }
+
+    TrafficSpawner[] activeSpawners =
+        GetActiveHeavySpawners();
+
+    telemetryChannel.SendSnapshot(
+        evaluationSeed,
+        timer,
+        GetCurrentStage(),
+        (int)currentScenario,
+        (int)currentActiveState,
+        hasRolledShockwave,
+        activeHeavyMask[0],
+        activeHeavyMask[1],
+        activeHeavyMask[2],
+        phaseDuration,
+        cooldownStartTime,
+        activeSpawners
+    );
+}
+
+    // ============ 车道掩码生成 ============
+
+    /// <summary>
+    /// 根据 currentActiveState 重新生成潮汐车道掩码。
+    /// - Uniform：将 activeHeavyMask 全部设为 false（全网均衡）
+    /// - 单向潮汐：60%概率出现 1 条重载车道，40%概率出现 2 条重载车道。绝对不会出现 3 条全满的情况。
+    /// </summary>
+    private void PrepareEvaluationShockwave(int seed)
+{
+    // Independent from UnityEngine.Random used by vehicles.
+    System.Random scenarioRandom =
+        new System.Random(seed);
+
+    plannedShockwaveState =
+        (ActiveShockwaveState)scenarioRandom.Next(0, 5);
+
+    for (int i = 0; i < plannedHeavyMask.Length; i++)
+    {
+        plannedHeavyMask[i] = false;
+    }
+
+    if (
+        plannedShockwaveState ==
+        ActiveShockwaveState.Uniform
+    )
+    {
+        return;
+    }
+
+    // Preserve the original 60% one-lane / 40% two-lane rule.
+    int numHeavyLanes =
+        scenarioRandom.Next(0, 100) < 60 ? 1 : 2;
+
+    List<int> availableIndices =
+        new List<int> { 0, 1, 2 };
+
+    for (int i = 0; i < numHeavyLanes; i++)
+    {
+        int randomIndex =
+            scenarioRandom.Next(
+                0,
+                availableIndices.Count
+            );
+
+        int selectedLane =
+            availableIndices[randomIndex];
+
+        plannedHeavyMask[selectedLane] = true;
+        availableIndices.RemoveAt(randomIndex);
+    }
+}
+
+private void ActivatePreparedEvaluationShockwave()
+{
+    currentActiveState = plannedShockwaveState;
+
+    for (int i = 0; i < activeHeavyMask.Length; i++)
+    {
+        activeHeavyMask[i] = plannedHeavyMask[i];
+    }
+
+    UpdateDebugHeavyLaneMask();
+}
+    private void GenerateActiveHeavyMask()
+    {
+        // 1. 初始化全 False
+        for (int i = 0; i < 3; i++) activeHeavyMask[i] = false;
+
+        if (currentActiveState != ActiveShockwaveState.Uniform)
+        {
+            // 2. 加权随机：60% 概率为 1 条车道，40% 概率为 2 条车道
+            int numHeavyLanes = (Random.Range(0, 100) < 60) ? 1 : 2;
+
+            // 3. 不重复地随机抽取对应数量的车道索引
+            System.Collections.Generic.List<int> availableIndices =
+                new System.Collections.Generic.List<int> { 0, 1, 2 };
+
+            for (int i = 0; i < numHeavyLanes; i++)
+            {
+                int randomIndex = Random.Range(0, availableIndices.Count);
+                int selectedLane = availableIndices[randomIndex];
+                activeHeavyMask[selectedLane] = true;
+                availableIndices.RemoveAt(randomIndex); // 移除已抽中的，防止重复
+            }
+        }
+
+        // 4. 绝对保留此 Debug 更新调用！
+        UpdateDebugHeavyLaneMask();
+    }
+
+    /// <summary>
+    /// 更新 Inspector Debug 显示字符串。
+    /// </summary>
+    private void UpdateDebugHeavyLaneMask()
+    {
+        Debug_HeavyLaneMask = $"[L0:{activeHeavyMask[0]} L1:{activeHeavyMask[1]} L2:{activeHeavyMask[2]}]";
+    }
+
+    // ============ 核心轮换逻辑 ============
+
+    /// <summary>
+    /// 每局开局时调用，重置所有运行时状态。
+    /// - 计时器清零
+    /// - 盲盒抽取标记复位（允许本局重新抽取一次）
+    /// - 前 phaseDuration 秒强制为 Uniform
+    /// </summary>
+    public void ResetForNewEpisode()
+    {
+        agentResetCallCount++;
+
+    // 【核心数学锁】：任意连续的 9 次调用中，必定且只有一次是 9 的倍数！
+    // 只有触发 9 的倍数时，才执行真正的全局车流重置和种子更迭。
+    if (agentResetCallCount % 9 == 0)
+    {
+       if (isEvaluationMode)
+    {
+        evaluationSeed += 1;
+
+        // Retained for the current vehicle random behavior.
+        UnityEngine.Random.InitState(evaluationSeed);
+
+        // Independent scenario random stream.
+        PrepareEvaluationShockwave(evaluationSeed);
+
+        Debug.Log(
+            $"[评估模式] 全局开局 Seed={evaluationSeed}, " +
+            $"预生成潮汐={plannedShockwaveState}, " +
+            $"Mask=[{plannedHeavyMask[0]}, " +
+            $"{plannedHeavyMask[1]}, " +
+            $"{plannedHeavyMask[2]}]"
+        );
+    }
+
+        timer = 0f;
+        hasRolledShockwave = false;
+        currentActiveState = ActiveShockwaveState.Uniform;
+
+        for (int i = 0; i < 3; i++) activeHeavyMask[i] = false;
+        UpdateDebugHeavyLaneMask();
+            // 必须放在随机种子重置之后
+            RestartAllSpawnersForNewEpisode();
+            // 发送新一局的初始状态
+            SendTelemetrySnapshot();
+        }
+    }
+
+    // ============ 核心查询接口 ============
+
+    /// <summary>
+    /// 根据当前场景模式和出生点方位，返回发车间距乘数。
+    ///
+    /// 返回值语义（Spawner 基础发车间距 Min=3, Max=7）：
+    ///   1.8f  = 均匀期：全网均衡发车（5.4 秒/辆）
+    ///   0.6f  = 潮汐受灾方向（方向命中 + 掩码命中）：局部极限施压（1.8 秒/辆）
+    ///   2.5f  = 非潮汐方向或未被抽中的车道：主动放缓（7.5 秒/辆），保持总流量守恒
+    ///
+    /// 约束：phaseDuration 秒后的冲击波仅来自东、西、南、北的某一个单一方向，绝不多方向同时爆发。
+    /// </summary>
+    public float GetSpawnIntervalMultiplier(SpawnerDirection dir, int groupIndex)
+    {
+        // 保险处理：越界索引默认使用第 0 组掩码
+        if (groupIndex < 0) groupIndex = 0;
+        if (groupIndex > 2) groupIndex = 2;
+
+        // 0. 冷却消散期（cooldownStartTime 秒之后）：全网恢复极低车流，让积压车辆消化完毕
+        if (timer >= cooldownStartTime)
+        {
+            return 3.0f;
+        }
+
+        // 1. 均匀期，或 cooldownStartTime 秒后抽中了"继续均匀"
+        if (currentScenario == TrafficScenario.UniformFlow ||
+            (currentScenario == TrafficScenario.DynamicShockwave && currentActiveState == ActiveShockwaveState.Uniform))
+        {
+            return 2.5f;
+        }
+
+        // 2. 潮汐期：判定当前方向是否为受灾方向
+        if (currentScenario == TrafficScenario.DynamicShockwave)
+        {
+            bool isHeavyDir = false;
+            if (currentActiveState == ActiveShockwaveState.EastHeavy  && dir == SpawnerDirection.East)  isHeavyDir = true;
+            if (currentActiveState == ActiveShockwaveState.WestHeavy  && dir == SpawnerDirection.West)  isHeavyDir = true;
+            if (currentActiveState == ActiveShockwaveState.NorthHeavy && dir == SpawnerDirection.North) isHeavyDir = true;
+            if (currentActiveState == ActiveShockwaveState.SouthHeavy && dir == SpawnerDirection.South) isHeavyDir = true;
+
+            // 方向命中 + 掩码命中 → 真正的潮汐车道
+            if (isHeavyDir && activeHeavyMask[groupIndex])
+            {
+                return 1.2f; // 极速发车（3.5 秒/辆）
+            }
+            else
+            {
+                return 3f; // 非受灾方向，或同方向但未被抽中的车道，发车放缓（6.0 秒/辆）
+            }
+        }
+
+        return 2.5f; // 防错默认值
+    }
+
+    // ============ 调试工具 ============
+
+    [Header("Runtime Debug (Read Only)")]
+    [Tooltip("当前阶段已消耗时间（秒）")]
+    public float debug_PhaseTimer;
+    [Tooltip("面板选择的场景模式")]
+    public TrafficScenario debug_CurrentScenario;
+    [Tooltip("当前实际生效的子模式（动态模式专用）")]
+    public ActiveShockwaveState debug_CurrentActiveState;
+    [Tooltip("是否已完成盲盒抽取")]
+    public bool debug_HasRolledShockwave;
+    [Tooltip("当前潮汐车道掩码")]
+    public string Debug_HeavyLaneMask;
+
+    private void OnValidate()
+    {
+        debug_PhaseTimer = timer;
+        debug_CurrentScenario = currentScenario;
+        debug_CurrentActiveState = currentActiveState;
+        debug_HasRolledShockwave = hasRolledShockwave;
+        UpdateDebugHeavyLaneMask();
+    }
+}
